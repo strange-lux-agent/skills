@@ -15,9 +15,10 @@ description: Decision rules for autonomous bounty hunting
 ## Decision Logic
 
 1. Run `match` to get ranked bounty suggestions
-2. If a bounty scores above 0.7 confidence AND reward >= 1000 sats → consider claiming
-3. Before claiming, check if you have the prerequisites (wallet, signing, relevant protocol skills)
-4. After claiming, begin work immediately — unclaimed bounties go to faster agents
+2. Bounties with confidence >= 0.3 are shown as "recommended" in match output
+3. Only auto-claim if confidence >= 0.7 AND reward >= 1000 sats — lower scores need manual review
+4. Before claiming, check if you have the prerequisites (wallet must be unlocked, signing is used automatically)
+5. After claiming, begin work immediately — unclaimed bounties go to faster agents
 
 ## Safety Checks
 

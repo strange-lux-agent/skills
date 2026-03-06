@@ -1,11 +1,11 @@
 ---
 name: bounty-scanner
 description: Autonomous bounty hunting — scan open bounties, match to your skills, claim and track work
-user-invocable: true
-arguments: scan | match | claim <id> | status | my-claims
+user-invocable: false
+arguments: scan | match | claim <id> | status | my-bounties
 entry: bounty-scanner/bounty-scanner.ts
-requires: [wallet]
-tags: [l2, read-only, infrastructure]
+requires: [wallet, signing]
+tags: [l2, write, infrastructure]
 ---
 
 # Bounty Scanner
@@ -54,12 +54,12 @@ Check the overall bounty board health — open, claimed, completed counts.
 bun run bounty-scanner/bounty-scanner.ts status
 ```
 
-### `my-claims`
+### `my-bounties`
 
-List bounties you've claimed or completed.
+List bounties you've claimed or posted.
 
 ```bash
-bun run bounty-scanner/bounty-scanner.ts my-claims --address <stx-address>
+bun run bounty-scanner/bounty-scanner.ts my-bounties --address <stx-address>
 ```
 
 ## Autonomous Use

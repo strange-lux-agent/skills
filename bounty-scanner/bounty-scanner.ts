@@ -9,20 +9,44 @@
 import { Command } from "commander";
 import { printJson, handleError } from "../src/lib/utils/cli.js";
 import { getWalletManager } from "../src/lib/services/wallet-manager.js";
-import { readFileSync, existsSync } from "fs";
+import { signMessageHashRsv } from "@stacks/transactions";
+import { hashMessage } from "@stacks/encryption";
+import { bytesToHex } from "@stacks/common";
+import { readFileSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
 
 const BOUNTY_API = "https://1btc-news-api.p-d07.workers.dev";
 
 // ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface Bounty {
+  id: string;
+  title: string;
+  description?: string;
+  reward: number;
+  status: string;
+  claimer?: string;
+  poster?: string;
+  created_at: number;
+}
+
+interface SkillInfo {
+  name: string;
+  description: string;
+  tags: string[];
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function fetchBounties(): Promise<any[]> {
+async function fetchBounties(): Promise<Bounty[]> {
   const res = await fetch(`${BOUNTY_API}/bounties`);
   if (!res.ok) throw new Error(`Bounty API returned ${res.status}`);
-  const data = await res.json();
-  return (data as any).bounties ?? [];
+  const data = (await res.json()) as { bounties?: Bounty[] };
+  return data.bounties ?? [];
 }
 
 function getStxAddress(address?: string): string {
@@ -37,17 +61,101 @@ function getStxAddress(address?: string): string {
 }
 
 /**
- * Load installed skill names and descriptions from local SKILL.md files.
+ * Get the active wallet account or throw a consistent error.
  */
-function getInstalledSkills(): Array<{ name: string; description: string; tags: string[] }> {
-  const skills: Array<{ name: string; description: string; tags: string[] }> = [];
+function requireUnlockedWallet() {
+  const walletManager = getWalletManager();
+  const account = walletManager.getActiveAccount();
+  if (!account) {
+    throw new Error(
+      "Wallet is not unlocked. Use wallet/wallet.ts unlock first."
+    );
+  }
+  return account;
+}
+
+/**
+ * Sign a claim message proving control of the STX address.
+ * Uses the Stacks message signing format (same as signing skill's stacks-sign).
+ */
+function signClaimMessage(
+  bountyId: string,
+  stxAddress: string,
+  privateKey: string
+): string {
+  const message = `claim:${bountyId}:${stxAddress}:${Date.now()}`;
+  const msgHash = hashMessage(message);
+  const msgHashHex = bytesToHex(msgHash);
+  const signature = signMessageHashRsv({
+    messageHash: msgHashHex,
+    privateKey,
+  });
+  return signature;
+}
+
+/**
+ * Parse simple YAML frontmatter from a SKILL.md file.
+ * Extracts name, description, and tags fields.
+ */
+function parseFrontmatter(content: string): SkillInfo | null {
+  const lines = content.split("\n");
+  let inFrontmatter = false;
+  const fields: Record<string, string> = {};
+
+  for (const line of lines) {
+    if (line.trim() === "---") {
+      if (!inFrontmatter) {
+        inFrontmatter = true;
+        continue;
+      } else {
+        break;
+      }
+    }
+    if (inFrontmatter) {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx > 0) {
+        const key = line.slice(0, colonIdx).trim();
+        const value = line.slice(colonIdx + 1).trim();
+        fields[key] = value;
+      }
+    }
+  }
+
+  if (!fields.name) return null;
+
+  // Parse bracket list for tags: [l2, write, infrastructure]
+  let tags: string[] = [];
+  if (fields.tags) {
+    const raw = fields.tags;
+    if (raw.startsWith("[") && raw.endsWith("]")) {
+      tags = raw
+        .slice(1, -1)
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    }
+  }
+
+  return {
+    name: fields.name,
+    description: fields.description ?? "",
+    tags,
+  };
+}
+
+/**
+ * Load installed skill names and descriptions.
+ * First tries skills.json manifest, then falls back to scanning SKILL.md files.
+ */
+function getInstalledSkills(): SkillInfo[] {
   const repoRoot = join(import.meta.dir, "..");
 
-  // Read skills.json if it exists
+  // Try skills.json first (faster)
   const manifestPath = join(repoRoot, "skills.json");
   if (existsSync(manifestPath)) {
     try {
       const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      const skills: SkillInfo[] = [];
       for (const skill of manifest.skills ?? []) {
         skills.push({
           name: skill.name ?? "",
@@ -55,10 +163,41 @@ function getInstalledSkills(): Array<{ name: string; description: string; tags: 
           tags: skill.tags ?? [],
         });
       }
-      return skills;
+      if (skills.length > 0) return skills;
     } catch {
       // fall through to directory scan
     }
+  }
+
+  // Directory scan fallback: find all */SKILL.md files
+  const skills: SkillInfo[] = [];
+  try {
+    const entries = readdirSync(repoRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      // Skip non-skill directories
+      if (
+        entry.name.startsWith(".") ||
+        entry.name === "node_modules" ||
+        entry.name === "src" ||
+        entry.name === "scripts" ||
+        entry.name === "dist"
+      ) {
+        continue;
+      }
+      const skillMdPath = join(repoRoot, entry.name, "SKILL.md");
+      if (existsSync(skillMdPath)) {
+        try {
+          const content = readFileSync(skillMdPath, "utf-8");
+          const info = parseFrontmatter(content);
+          if (info) skills.push(info);
+        } catch {
+          // skip unreadable files
+        }
+      }
+    }
+  } catch {
+    // repo root unreadable — return empty
   }
 
   return skills;
@@ -70,7 +209,7 @@ function getInstalledSkills(): Array<{ name: string; description: string; tags: 
  */
 function scoreBountyMatch(
   bounty: { title: string; description: string },
-  skills: Array<{ name: string; description: string; tags: string[] }>
+  skills: SkillInfo[]
 ): { score: number; matchedSkills: string[]; reason: string } {
   const bountyText = `${bounty.title} ${bounty.description}`.toLowerCase();
   const matchedSkills: string[] = [];
@@ -78,8 +217,11 @@ function scoreBountyMatch(
 
   // Keyword matching against skill names and descriptions
   for (const skill of skills) {
-    const skillWords = `${skill.name} ${skill.description} ${skill.tags.join(" ")}`.toLowerCase();
-    const skillTokens = skillWords.split(/[\s\-_,./]+/).filter((t) => t.length > 2);
+    const skillWords =
+      `${skill.name} ${skill.description} ${skill.tags.join(" ")}`.toLowerCase();
+    const skillTokens = skillWords
+      .split(/[\s\-_,./]+/)
+      .filter((t) => t.length > 2);
 
     let hits = 0;
     for (const token of skillTokens) {
@@ -115,7 +257,9 @@ function scoreBountyMatch(
 
 const program = new Command()
   .name("bounty-scanner")
-  .description("Autonomous bounty hunting — scan, match, claim, and track bounties");
+  .description(
+    "Autonomous bounty hunting — scan, match, claim, and track bounties"
+  );
 
 // -- scan -------------------------------------------------------------------
 program
@@ -125,8 +269,8 @@ program
     try {
       const bounties = await fetchBounties();
       const open = bounties
-        .filter((b: any) => b.status === "open")
-        .map((b: any) => ({
+        .filter((b) => b.status === "open")
+        .map((b) => ({
           id: b.id,
           title: b.title,
           reward: b.reward,
@@ -151,10 +295,10 @@ program
     try {
       const bounties = await fetchBounties();
       const skills = getInstalledSkills();
-      const open = bounties.filter((b: any) => b.status === "open");
+      const open = bounties.filter((b) => b.status === "open");
 
       const matches = open
-        .map((b: any) => {
+        .map((b) => {
           const match = scoreBountyMatch(
             { title: b.title, description: b.description ?? "" },
             skills
@@ -170,6 +314,8 @@ program
         })
         .sort((a, b) => b.confidence - a.confidence);
 
+      // Display threshold: 0.3 for showing recommendations
+      // Agent auto-claim threshold: 0.7 (see AGENT.md decision logic)
       const recommended = matches.filter((m) => m.confidence >= 0.3);
 
       printJson({
@@ -178,6 +324,7 @@ program
         openBounties: open.length,
         recommendedBounties: recommended.length,
         matches: matches.slice(0, 10),
+        note: "Display threshold: 0.3 (recommended). Auto-claim threshold: 0.7 (see AGENT.md).",
         action:
           recommended.length > 0
             ? `Top match: "${recommended[0].title}" (${recommended[0].confidence * 100}% confidence, ${recommended[0].reward} sats)`
@@ -192,15 +339,24 @@ program
 program
   .command("claim")
   .argument("<bounty-id>", "Bounty ID to claim")
-  .description("Claim a bounty for your agent")
+  .description("Claim a bounty for your agent (requires unlocked wallet)")
   .action(async (bountyId: string) => {
     try {
-      const stxAddress = getStxAddress();
+      const account = requireUnlockedWallet();
+      const stxAddress = account.address;
+      const signature = signClaimMessage(
+        bountyId,
+        stxAddress,
+        account.privateKey
+      );
 
       const res = await fetch(`${BOUNTY_API}/bounties/${bountyId}/claim`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ claimer: stxAddress }),
+        body: JSON.stringify({
+          claimer: stxAddress,
+          signature,
+        }),
       });
 
       const data = await res.json();
@@ -208,7 +364,7 @@ program
       if (!res.ok) {
         printJson({
           success: false,
-          error: (data as any).error ?? `HTTP ${res.status}`,
+          error: (data as Record<string, unknown>).error ?? `HTTP ${res.status}`,
           bountyId,
         });
         return;
@@ -236,13 +392,13 @@ program
 
       const stats = {
         total: bounties.length,
-        open: bounties.filter((b: any) => b.status === "open").length,
-        claimed: bounties.filter((b: any) => b.status === "claimed").length,
-        completed: bounties.filter((b: any) => b.status === "completed").length,
-        cancelled: bounties.filter((b: any) => b.status === "cancelled").length,
+        open: bounties.filter((b) => b.status === "open").length,
+        claimed: bounties.filter((b) => b.status === "claimed").length,
+        completed: bounties.filter((b) => b.status === "completed").length,
+        cancelled: bounties.filter((b) => b.status === "cancelled").length,
         totalRewardsOpen: bounties
-          .filter((b: any) => b.status === "open")
-          .reduce((sum: number, b: any) => sum + (b.reward ?? 0), 0),
+          .filter((b) => b.status === "open")
+          .reduce((sum, b) => sum + (b.reward ?? 0), 0),
       };
 
       printJson({
@@ -255,10 +411,10 @@ program
     }
   });
 
-// -- my-claims --------------------------------------------------------------
+// -- my-bounties ------------------------------------------------------------
 program
-  .command("my-claims")
-  .description("List bounties you have claimed or completed")
+  .command("my-bounties")
+  .description("List bounties you have claimed or posted")
   .option("--address <stx>", "Your STX address")
   .action(async (opts: { address?: string }) => {
     try {
@@ -266,17 +422,15 @@ program
       const bounties = await fetchBounties();
 
       const mine = bounties.filter(
-        (b: any) =>
-          b.claimer === stxAddress ||
-          b.poster === stxAddress
+        (b) => b.claimer === stxAddress || b.poster === stxAddress
       );
 
       printJson({
         success: true,
         agent: stxAddress,
-        claimed: mine.filter((b: any) => b.claimer === stxAddress).length,
-        posted: mine.filter((b: any) => b.poster === stxAddress).length,
-        bounties: mine.map((b: any) => ({
+        claimed: mine.filter((b) => b.claimer === stxAddress).length,
+        posted: mine.filter((b) => b.poster === stxAddress).length,
+        bounties: mine.map((b) => ({
           id: b.id,
           title: b.title,
           status: b.status,
