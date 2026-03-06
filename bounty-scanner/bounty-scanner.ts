@@ -15,7 +15,8 @@ import { bytesToHex } from "@stacks/common";
 import { readFileSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
 
-const BOUNTY_API = "https://1btc-news-api.p-d07.workers.dev";
+const BOUNTY_API =
+  process.env.BOUNTY_API_URL ?? "https://1btc-news-api.p-d07.workers.dev";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -77,30 +78,54 @@ function requireUnlockedWallet() {
 /**
  * Sign a claim message proving control of the STX address.
  * Uses the Stacks message signing format (same as signing skill's stacks-sign).
+ * Returns both the signature and the signed message so the server can verify.
+ *
+ * NOTE: The upstream bounty API at bounty.drx4.xyz uses BIP-322/BIP-137 BTC
+ * signatures with format: "agent-bounties | claim-bounty | {btc_address} |
+ * bounties/{uuid} | {timestamp}". This skill currently uses Stacks message
+ * signing against a different API. Full alignment is tracked upstream.
  */
 function signClaimMessage(
   bountyId: string,
   stxAddress: string,
   privateKey: string
-): string {
-  const message = `claim:${bountyId}:${stxAddress}:${Date.now()}`;
+): { signature: string; message: string; timestamp: string } {
+  const timestamp = new Date().toISOString();
+  const message = `claim:${bountyId}:${stxAddress}:${timestamp}`;
   const msgHash = hashMessage(message);
   const msgHashHex = bytesToHex(msgHash);
   const signature = signMessageHashRsv({
     messageHash: msgHashHex,
     privateKey,
   });
-  return signature;
+  return { signature, message, timestamp };
 }
 
 /**
- * Parse simple YAML frontmatter from a SKILL.md file.
- * Extracts name, description, and tags fields.
+ * Parse a bracket-list value like "[]" or "[wallet]" or "[l2, defi, write]".
+ * Matches the logic in scripts/generate-manifest.ts.
+ */
+function parseBracketList(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+    return trimmed.length > 0 ? [trimmed] : [];
+  }
+  const inner = trimmed.slice(1, -1).trim();
+  if (inner.length === 0) return [];
+  return inner
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Parse YAML frontmatter from a SKILL.md file.
+ * Matches the parsing logic in scripts/generate-manifest.ts.
  */
 function parseFrontmatter(content: string): SkillInfo | null {
   const lines = content.split("\n");
   let inFrontmatter = false;
-  const fields: Record<string, string> = {};
+  const frontmatterLines: string[] = [];
 
   for (const line of lines) {
     if (line.trim() === "---") {
@@ -112,34 +137,25 @@ function parseFrontmatter(content: string): SkillInfo | null {
       }
     }
     if (inFrontmatter) {
-      const colonIdx = line.indexOf(":");
-      if (colonIdx > 0) {
-        const key = line.slice(0, colonIdx).trim();
-        const value = line.slice(colonIdx + 1).trim();
-        fields[key] = value;
-      }
+      frontmatterLines.push(line);
     }
+  }
+
+  const fields: Record<string, string> = {};
+  for (const line of frontmatterLines) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) continue;
+    const key = line.slice(0, colonIdx).trim();
+    const value = line.slice(colonIdx + 1).trim();
+    fields[key] = value;
   }
 
   if (!fields.name) return null;
 
-  // Parse bracket list for tags: [l2, write, infrastructure]
-  let tags: string[] = [];
-  if (fields.tags) {
-    const raw = fields.tags;
-    if (raw.startsWith("[") && raw.endsWith("]")) {
-      tags = raw
-        .slice(1, -1)
-        .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-    }
-  }
-
   return {
     name: fields.name,
     description: fields.description ?? "",
-    tags,
+    tags: parseBracketList(fields.tags ?? "[]"),
   };
 }
 
@@ -234,11 +250,11 @@ function scoreBountyMatch(
     }
   }
 
-  // Bonus for having wallet/signing (most bounties need them)
-  const hasWallet = skills.some((s) => s.name === "wallet");
-  const hasSigning = skills.some((s) => s.name === "signing");
-  if (hasWallet) score += 0.1;
-  if (hasSigning) score += 0.1;
+  // Bonus for wallet/signing only when bounty mentions payment or signing
+  const mentionsPayment = /pay|transfer|send|sats|btc|stx|sbtc|escrow|fund/i.test(bountyText);
+  const mentionsSigning = /sign|signature|verify|auth/i.test(bountyText);
+  if (mentionsPayment && skills.some((s) => s.name === "wallet")) score += 0.1;
+  if (mentionsSigning && skills.some((s) => s.name === "signing")) score += 0.1;
 
   // Cap at 1.0
   score = Math.min(score, 1.0);
@@ -344,7 +360,7 @@ program
     try {
       const account = requireUnlockedWallet();
       const stxAddress = account.address;
-      const signature = signClaimMessage(
+      const { signature, message, timestamp } = signClaimMessage(
         bountyId,
         stxAddress,
         account.privateKey
@@ -356,6 +372,8 @@ program
         body: JSON.stringify({
           claimer: stxAddress,
           signature,
+          message,
+          timestamp,
         }),
       });
 
