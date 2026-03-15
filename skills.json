@@ -1,6 +1,6 @@
 {
-  "version": "0.22.0",
-  "generated": "2026-03-13T21:44:57.102Z",
+  "version": "0.23.0",
+  "generated": "2026-03-15T10:31:25.945Z",
   "skills": [
     {
       "name": "agent-lookup",
@@ -207,6 +207,15 @@
         "preorder_bns_name",
         "register_bns_name"
       ]
+    },
+    {
+      "name": "bounty-scanner",
+      "description": "Autonomous bounty hunting — scan open bounties, match to your skills, claim and track work",
+      "entry": "",
+      "arguments": [],
+      "requires": [],
+      "tags": [],
+      "userInvocable": false
     },
     {
       "name": "btc",
